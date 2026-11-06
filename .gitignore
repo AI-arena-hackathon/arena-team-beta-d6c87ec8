@@ -42,3 +42,4 @@ logs/
 Thumbs.db
 .idea/
 .vscode/
+/.pydeps/

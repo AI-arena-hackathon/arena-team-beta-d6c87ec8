@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local Lens AI Analytics</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: system-ui, -apple-system, sans-serif; margin: 0; background: #fff; color: #1a1a1a; line-height: 1.5; }
+    header { padding: 1rem 1.25rem; border-bottom: 2px solid #1a1a1a; }
+    h1 { font-size: 1.4rem; margin: 0; }
+    main { padding: 1rem 1.25rem; max-width: 46rem; }
+    section { margin-bottom: 2rem; }
+    h2 { font-size: 1.15rem; margin: 0 0 0.75rem; }
+    #recommendations { list-style: none; margin: 0; padding: 0; }
+    #recommendations li { border: 1px solid #1a1a1a; border-radius: 8px; padding: 0.75rem; margin-bottom: 0.75rem; }
+    .bar-row { display: flex; align-items: center; gap: 0.75rem; }
+    .bar-label { flex: 0 0 auto; font-weight: 600; min-width: 8rem; overflow-wrap: anywhere; }
+    .bar-track { flex: 1 1 auto; background: #eee; border-radius: 4px; height: 1.1rem; overflow: hidden; }
+    .bar-fill { height: 100%; background: #1a6fd6; border-radius: 4px; }
+    .bar-value { flex: 0 0 auto; min-width: 5rem; text-align: right; }
+    .meta { font-size: 0.9rem; margin-top: 0.4rem; }
+    #empty { padding: 0.75rem; border: 1px dashed #1a1a1a; border-radius: 8px; }
+    form { display: grid; gap: 0.75rem; max-width: 30rem; }
+    label { display: grid; gap: 0.25rem; font-weight: 600; }
+    input, button { font: inherit; padding: 0.5rem; border: 1px solid #1a1a1a; border-radius: 4px; }
+    button { background: #1a6fd6; color: #fff; border: 0; border-radius: 4px; padding: 0.6rem 1rem; font-weight: 600; cursor: pointer; }
+    button:focus-visible, input:focus-visible { outline: 3px solid #1a6fd6; outline-offset: 2px; }
+    .skip-link { position: absolute; left: -9999px; top: 0; background: #1a6fd6; color: #fff; padding: 0.5rem 1rem; z-index: 10; border-radius: 0 0 4px 0; }
+    .skip-link:focus { left: 0; }
+    #sms-status { margin-top: 0.75rem; font-weight: 600; }
+  </style>
+</head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to main content</a>
+    <header>
+      <h1>Local Lens AI Analytics</h1>
+    </header>
+    <main id="main-content">
+    <section aria-labelledby="restock-heading">
+      <h2 id="restock-heading">Top items to restock</h2>
+      <ol id="recommendations" aria-live="polite">
+        <li id="empty" role="status">Loading recommendations…</li>
+      </ol>
+    </section>
+    <section aria-labelledby="sms-heading">
+      <h2 id="sms-heading">SMS alerts</h2>
+      <form id="sms-form">
+        <label for="sms-phone">Phone number for SMS alerts</label>
+        <input id="sms-phone" name="phone" type="tel" autocomplete="tel" placeholder="+15550001111">
+        <label for="sms-threshold">SMS alert threshold (forecast units)</label>
+        <input id="sms-threshold" name="threshold" type="number" min="0" step="any" value="10">
+        <label for="sms-enabled">
+          <input id="sms-enabled" name="enabled" type="checkbox" checked>
+          Enable SMS alerts
+        </label>
+        <button id="send-alert" type="submit">Send SMS alert</button>
+      </form>
+      <div id="sms-status" role="status" aria-live="polite"></div>
+    </section>
+  </main>
+  <script>
+    const recommendationsEl = document.getElementById("recommendations");
+    const emptyEl = document.getElementById("empty");
+    const smsForm = document.getElementById("sms-form");
+    const smsStatus = document.getElementById("sms-status");
+
+    function renderRecommendations(items) {
+      recommendationsEl.replaceChildren();
+      if (items.length === 0) {
+        const li = document.createElement("li");
+        li.id = "empty";
+        li.setAttribute("role", "status");
+        li.textContent = "No restock recommendations right now.";
+        recommendationsEl.appendChild(li);
+        return;
+      }
+      for (const item of items) {
+        const li = document.createElement("li");
+        const heading = document.createElement("h3");
+        heading.textContent = item.item_id;
+        const barRow = document.createElement("div");
+        barRow.className = "bar-row";
+        const label = document.createElement("span");
+        label.className = "bar-label";
+        label.textContent = item.item_id;
+        const track = document.createElement("div");
+        track.className = "bar-track";
+        track.setAttribute("role", "img");
+        track.setAttribute("aria-label", `Restock forecast bar for ${item.item_id}: forecast ${item.forecast_qty} units against stock ${item.stock_qty}`);
+        const fill = document.createElement("div");
+        fill.className = "bar-fill";
+        fill.setAttribute("aria-hidden", "true");
+        fill.style.width = `${Math.min(100, (item.forecast_qty / Math.max(...items.map((i) => i.forecast_qty), 1)) * 100)}%`;
+        const value = document.createElement("span");
+        value.className = "bar-value";
+        value.textContent = `${item.forecast_qty} units`;
+        track.appendChild(fill);
+        barRow.append(label, track, value);
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        meta.textContent = `Stock ${item.stock_qty} · reorder ~${item.reorder_qty} · confidence ${Math.round(item.confidence * 100)}%`;
+        li.append(heading, barRow, meta);
+        recommendationsEl.appendChild(li);
+      }
+    }
+
+    const lastRecommendations = [];
+
+    async function loadRecommendations() {
+      const response = await fetch("/recommendations");
+      const items = await response.json();
+      lastRecommendations = items;
+      renderRecommendations(items);
+    }
+
+    smsForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const payload = {
+        item_id: document.getElementById("sms-threshold").value ? recommendationsTopId() : null,
+      };
+      const sendButton = document.getElementById("send-alert");
+      sendButton.disabled = true;
+      try {
+        const response = await fetch("/alerts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const body = await response.json();
+        smsStatus.textContent = body.sent
+          ? `SMS alert sent to ${body.to} for ${body.item_id}.`
+          : `SMS alert not sent: ${body.reason ?? "unknown"}.`;
+      } catch (error) {
+        smsStatus.textContent = "Could not send SMS alert.";
+      } finally {
+        sendButton.disabled = false;
+      }
+    });
+
+    function recommendationsTopId() {
+      const items = window.__lastRecommendations ?? [];
+      return items.length > 0 ? items[0].item_id : null;
+    }
+
+    window.__lastRecommendations = [];
+    loadRecommendations().then((items) => {
+      window.__lastRecommendations = items;
+    }).catch(() => {
+      smsStatus.textContent = "Could not load recommendations.";
+    });
+  </script>
+</body>
+</html>
