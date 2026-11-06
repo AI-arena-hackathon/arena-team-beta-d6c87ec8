@@ -1,0 +1,128 @@
+# arena-team-base — spec §7, §8
+#
+# Binary whitelist at runtime: node, npm, npx, git, opencode, sh, rg
+# (ripgrep — OpenCode's glob/grep tools shell out to it; without it those
+# tools fail with "ripgrep execution failed" and the agent has to fall back
+# to bash), python3, pip3 (the locked-down verification step byte-compiles
+# and tests Python-stack team repos — the 2026-07-29..08-01 event found a
+# team's Python code never ran because the image had no Python at all),
+# chromium-browser (Alpine's own musl chromium, driven by the Playwright MCP
+# server for the agent's browser self-verification — spec D2; Playwright's
+# bundled glibc browsers cannot run on musl, hence the system chromium + a
+# launchOptions.executablePath override in playwright-mcp.json).
+#
+# Chromium runs headless with --no-sandbox and --disable-dev-shm-usage (see
+# playwright-mcp.json): the container has cap-drop=ALL + no-new-privileges, so
+# there is no user-namespace sandbox to use, and /dev/shm is the tiny default
+# (shm is redirected to the /tmp tmpfs instead).
+# curl+bash are used to install OpenCode below, then explicitly removed in
+# the same layer (apk del) — they do NOT persist in the final image, keeping
+# the binary whitelist claim actually true rather than aspirational.
+#
+# This is the image both the agent-work step (scoped network) and the
+# locked-down verification step (--network=none) run from — see spec §8.
+
+FROM node:20-alpine
+
+# Pinned, not "whatever latest is at image-build time". The image is rebuilt
+# every single turn, so an unpinned install meant the agent driver could
+# change under a running competition with no commit to point at — and during
+# the P0-0a investigation it meant the crashing version could not be named or
+# re-tested. Bump this deliberately.
+ARG OPENCODE_VERSION=1.18.8
+
+# VERSION is consumed by the installer script (`requested_version=${VERSION:-}`),
+# so it has to be set on the `bash` that RUNS it, not on the `curl` that fetches
+# it — `VERSION=x curl ... | bash` looks right and silently installs latest.
+# python3/py3-pip are the correct Alpine package names on node:20-alpine
+# (Alpine's Python 3 + pip, provided via the py3-pip module). Unlike
+# curl/bash, they are deliberately KEPT in the final image: the verification
+# step needs them to build and test Python-stack team repos.
+RUN apk add --no-cache git=~2 ripgrep curl bash python3 py3-pip chromium chromium-swiftshader && \
+    curl -fsSL https://opencode.ai/install | VERSION="${OPENCODE_VERSION}" bash && \
+    mv /root/.opencode /opt/opencode 2>/dev/null || true && \
+    apk del curl bash && \
+    rm -rf /var/cache/apk/*
+ENV PATH="/opt/opencode/bin:${PATH}"
+
+# Playwright MCP (browser self-verification — spec D2), pinned like
+# OPENCODE_VERSION. Installed at image build time as a global npm package so
+# the running turn needs no registry egress (`npx` at runtime would). The MCP
+# server is a local stdio process inside the same container; the browser it
+# drives can only reach localhost (the Squid/iptables scope blocks everything
+# else). chromium-swiftshader (installed above) is what lets Alpine's chromium
+# render headless without a GPU.
+ARG PLAYWRIGHT_MCP_VERSION=0.0.79
+RUN npm install -g "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" && \
+    rm -rf /root/.npm 2>/dev/null || true
+
+# Baked-in provider config, not one carried by each team's repo — every team
+# gets the same skills/MCP/permissions regardless of what's in their
+# checkout. OPENCODE_CONFIG works independent of $HOME/project-root lookup,
+# which matters here since HOME gets pointed at the per-run tmpfs at runtime
+# (see team-build-turn.yml) and anything baked in under it would be hidden
+# by that mount.
+#
+# No custom provider block: the driver model comes from the dispatch (`model`
+# input, default openrouter/recursive/flint-v1.0:free as of 2026-10-25, with
+# `fallback_model` default openrouter/nvidia/nemotron-3-ultra-550b-a55b:free as
+# attempt 3 when both pools fail the pinned model) authenticated via
+# auth.json, not from config. A `workers-ai`
+# provider block lived here until 2026-09-21 and was removed with the shim
+# it served — see team-build-turn.yml.
+COPY opencode.json /opt/opencode/config/opencode.json
+ENV OPENCODE_CONFIG=/opt/opencode/config/opencode.json
+
+# Playwright MCP browser config: points at Alpine's system chromium
+# (executablePath) with the flags the sandbox requires (--no-sandbox,
+# --disable-dev-shm-usage). Read by @playwright/mcp via --config.
+COPY playwright-mcp.json /opt/arena-mcp/playwright-mcp.json
+
+# Build-turn skills (spec §8 agent workflow), baked in like the provider
+# config so every team gets the same quality gates regardless of their
+# checkout. Upstream: addyosmani/agent-skills, commit f03b4a84 (2026-08-05),
+# MIT. Pinned here the same way OPENCODE_VERSION is: the image rebuilds every
+# turn, so an unpinned copy would let upstream drift under a running
+# competition with nothing to point at.
+#
+# Wired via skills.paths in opencode.json (a top-level key since at least
+# v1.18.8 — verified against the v1 config schema at that tag), so the agent
+# in team-build-turn.yml's Phase A sees them without any dependency on
+# $HOME (which the workflow points at a tmpfs at runtime).
+#
+# Selection rationale — 4 of 24 upstream skills:
+#   - test-driven-development:      Phase B runs the repo's test suite
+#                                   (`npm test` / pytest); this makes that
+#                                   gate meaningful.
+#   - code-review-and-quality:      self-review before a turn commits.
+#   - security-and-hardening:       network-discipline + secrets rules the
+#                                   sandbox's egress filtering exists for.
+#   - debugging-and-error-recovery: root-cause discipline for build breaks.
+# Deliberately NOT included (each conflicts with the build-turn shape):
+#   - spec-driven-development / planning-and-task-breakdown / incremental-
+#     implementation: human review gates ("ask the human") that a --auto
+#     turn with no human can never pass.
+#   - ci-cd-and-automation / git-workflow-and-versioning: reference GitHub
+#     Actions/PR flows this agent cannot reach (no github.com egress).
+#   - browser-testing-with-devtools / performance-optimization / webperf:
+#     need a browser + DevTools MCP the sandbox does not have.
+#   - source-driven-development / context-engineering / documentation-and-
+#     adrs / idea-refine: heavier context than a single turn needs.
+# Verify after a build turn: grep opencode-turn.log for the skill's name
+# (skills surface to the model as loadable tools, not forced commands).
+COPY skills /opt/opencode/skills
+
+# Default non-root user (spec §7) for anyone running this image directly.
+# team-build-turn.yml overrides --user at runtime to match the GitHub
+# Actions runner's actual uid:gid instead of this hardcoded 1000 — the
+# bind-mounted /workspace is owned by whatever uid checked it out, and a
+# mismatched uid can't write to it even inside a "non-root" container.
+# Either way the container never runs as uid 0.
+RUN addgroup -g 1000 arena && adduser -D -u 1000 -G arena arena && \
+    chmod -R a+rX /opt/opencode /opt/arena-mcp 2>/dev/null || true
+USER 1000:1000
+
+WORKDIR /workspace
+
+# No CMD/ENTRYPOINT baked in — each step in team-build-turn.yml passes its
+# own command.

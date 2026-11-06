@@ -1,0 +1,11 @@
+{
+  "$comment": "Arena workspace pointers — read at the start of every build turn, alongside AGENTS.md and BACKLOG.md. Stable conventions only: nothing here rotates (model comes from the dispatch, secrets from the environment), so this file never drifts.",
+  "idea_brief": "README.md",
+  "backlog": "BACKLOG.md",
+  "conventions": "AGENTS.md",
+  "skills": [".arena/skills"],
+  "checks": {
+    "node": ["npm test", "npx tsc --noEmit"],
+    "python": ["python3 -m pytest -q", "python3 -m compileall -q ."]
+  }
+}

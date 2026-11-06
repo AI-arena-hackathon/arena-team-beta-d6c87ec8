@@ -1,0 +1,44 @@
+# Node
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+npm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Env / secrets — real values go in .env (gitignored); .env.example stays tracked
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+
+# ...except the arena's own verification artifacts, which MUST be tracked.
+#
+# `*.log` above silently swallowed both of these (found 2026-10-01, after
+# VERIFICATION_FAILURE.log turned out never to have been committed in ANY of
+# the four team repos across two events). The verify container writes the
+# report into the workspace, then `git add -A` skips it as ignored — so the
+# file existed on the runner and vanished before the push. The turn prompt and
+# AGENTS.md rule 3 both tell the agent to read it next turn; it was never
+# there. That is the mechanical cause of every "reported honestly, acted on by
+# nobody" case in docs/INCIDENT_2026-09-23_HARNESS.md: a 7-day-old TS2307
+# (alpha, 10 red CI runs) and three consecutive turns failing the same two
+# test files (beta) were both cases of the agent never being told what broke.
+!VERIFICATION_FAILURE.log
+!VERIFICATION_NOTE.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

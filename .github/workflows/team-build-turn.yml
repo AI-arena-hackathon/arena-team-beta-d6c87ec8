@@ -1,0 +1,1168 @@
+name: Team Build Turn
+
+# The run title carries turn_id because the Actions API cannot be queried by
+# workflow_dispatch input — listing runs is the only way to find one, and
+# without the id in the title there is no way to tell which run belongs to
+# which dispatched turn. reconcileBuildTurns (src/events/scheduler.ts) matches
+# on this string, so changing the format means changing that matcher too.
+run-name: >-
+  Build turn ${{ github.event.inputs.turn_id || github.event.client_payload.turn_id }}
+  (${{ github.event.inputs.team || github.event.client_payload.team }})
+
+# Spec §8. Triggered by the Cloudflare Worker via the GitHub API
+# (workflow_dispatch or repository_dispatch, per §8) once per agent build
+# turn — NOT continuously. Each run is a fresh, isolated VM (4 CPU / 16GB RAM
+# on public repos, confirmed from GitHub's own runner docs) that checks out
+# the repo, builds, commits, and exits. Git history is the persistence layer
+# between turns.
+#
+# Agent driver: OpenCode (opencode.ai), confirmed real/active/MIT-licensed,
+# with a documented non-interactive `opencode run` command meant for exactly
+# this kind of scripted CI use, and a custom-provider config path
+# (docker/opencode.json, OPENCODE_CONFIG) for pointing it at Workers AI
+# instead of a natively-supported provider. This replaces what would
+# otherwise be custom-built agent-loop code.
+
+on:
+  workflow_dispatch:
+    inputs:
+      team:
+        description: "Which team's build (alpha or beta)"
+        required: true
+        type: choice
+        options: [alpha, beta]
+      turn_id:
+        description: "Opaque turn identifier from the event engine, for log correlation"
+        required: true
+        type: string
+      task_prompt:
+        description: "What this turn's agent should work on"
+        required: true
+        type: string
+      model:
+        description: "OpenCode model id for this turn (free-model ids churn — config, not workflow edit)"
+        required: false
+        default: "openrouter/recursive/flint-v1.0:free"
+        type: string
+      fallback_model:
+        description: "Attempt-3 model when both pools fail the pinned model (upstream-outage survival, not quota)"
+        required: false
+        default: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
+        type: string
+  repository_dispatch:
+    types: [team-build-turn]
+
+concurrency:
+  group: build-turn-${{ github.event.inputs.team || github.event.client_payload.team }}
+  cancel-in-progress: false
+
+# The default GITHUB_TOKEN is read-only unless a repo/org's Actions settings
+# override it — don't rely on that being set globally, since a fresh repo
+# won't have it. Declare write access explicitly so "Commit progress"'s
+# `git push` (spec §8) works regardless of the repo-level default.
+permissions:
+  contents: write
+
+jobs:
+  build-turn:
+    runs-on: ubuntu-latest # 4 CPU / 16GB RAM / 14GB SSD on public repos, confirmed July 2026
+    timeout-minutes: 120 # well under the 6-hour hard cap; a single turn should never need this long
+    # No job-level env block on purpose: every secret is passed explicitly
+    # per step/container below, so a credential can never leak into a step
+    # that doesn't need it. Builds run on OpenCode Zen free tier (see Phase
+    # A --model flag), NOT on Groq or Workers AI. CF_*/GROQ_* secrets are
+    # gone with the shim (removed 2026-09-21 — run had zero requests).
+    steps:
+      - name: Checkout team repo at current state
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Record turn-start HEAD
+        # The "Enforce real build output" gate below must detect work that the
+        # agent COMMITTED as well as uncommitted file changes — AGENTS.md
+        # rule 5 explicitly tells the turn agent to "commit small, focused
+        # changes", so a good agent leaves a clean working tree and the old
+        # git-status-only check falsely reported "no file changes" (found live
+        # on the spike-ui-001 zen rerun: agent built the app, ran 7 green
+        # tests, committed twice, exited 0 — and was still failed). Capture
+        # the SHA the turn starts from; the gate compares against it.
+        id: turnstart
+        run: echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build team base image
+        # arena-team-base:latest doesn't persist between jobs (each run is a
+        # fresh VM), so it's built fresh here from docker/Dockerfile.arena-team-base
+        # every turn. If this step's ~10-20s becomes a real cost across many
+        # turns, push the built image to GHCR once and pull it here instead.
+        run: docker build -t arena-team-base:latest -f docker/Dockerfile.arena-team-base docker/
+
+      - name: Start egress-filtering proxy (spec §7 network scoping)
+        # Found live (2026-07-22 code review): the previous "SCOPED" comment
+        # on Phase A was aspirational — the docker run below it had no actual
+        # network restriction, full open egress, while injecting CF_API_TOKEN
+        # into a container running an AI agent with --auto (self-approving)
+        # against arbitrary prompts. Real secret-exfiltration risk.
+        #
+        # Real fix, not just a corrected comment: a Squid forward proxy on
+        # the RUNNER (not inside the sandboxed container) with a domain
+        # allowlist, combined with Docker's documented DOCKER-USER iptables
+        # chain (https://docs.docker.com/engine/network/packet-filtering-firewalls/)
+        # to DROP any container-originated traffic on 80/443 that doesn't go
+        # through the proxy. Even if something inside the container ignores
+        # the HTTP_PROXY/HTTPS_PROXY env vars set below (a compromised npm
+        # postinstall script, Node's built-in fetch, etc.), it physically
+        # cannot reach the internet directly — DOCKER-USER rules apply to all
+        # container traffic, they're not something a process inside the
+        # container can opt out of.
+        #
+        # Only package registries plus the agent's own inference endpoint:
+        # registry.npmjs.org for whatever the coding agent's own build needs
+        # to npm install, pypi.org/files.pythonhosted.org for the Phase B
+        # dependency-install step (Python-stack team repos), and .opencode.ai
+        # for OpenCode Zen traffic. api.cloudflare.com is deliberately absent:
+        # nothing in any container talks to Cloudflare (the retired Workers
+        # AI shim used to, via the runner — removed 2026-09-21).
+        # github.com/api.github.com are deliberately NOT allowlisted — the
+        # "Commit progress" step below does git push from the RUNNER, outside
+        # any container, so nothing inside Phase A's container legitimately
+        # needs GitHub access at all.
+        #
+        # api.groq.com added 2026-10-13 with the provider switch: build turns
+        # now call Groq, and the allowlist is an allowlist — the FIRST live turn
+        # on Groq died in 3s with squid's ERR_ACCESS_DENIED, i.e. our own
+        # egress filter blocked the agent's inference call. The allowlist has to
+        # name every inference endpoint the harness may use; it is not a
+        # convenience list. .opencode.ai is retained so a revert needs no
+        # allowlist edit.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq squid
+          sudo tee /etc/squid/squid.conf > /dev/null <<'EOF'
+          http_port 3128
+          acl allowed_ssl_ports port 443
+          acl CONNECT method CONNECT
+          acl allowed_domains dstdomain .registry.npmjs.org .pypi.org .files.pythonhosted.org .opencode.ai .openrouter.ai .groq.com
+          http_access allow CONNECT allowed_domains allowed_ssl_ports
+          http_access allow allowed_domains
+          http_access deny all
+          EOF
+          sudo systemctl restart squid
+          # DOCKER-USER: Docker's own hook chain for custom container-egress
+          # firewall rules — inserted rules here apply to traffic FORWARDED
+          # through docker's bridge (i.e. from containers), not to the
+          # runner/host's own traffic, so the proxy itself (running on the
+          # host, not in a container) is unaffected by these DROP rules.
+          sudo iptables -I DOCKER-USER -p tcp --dport 443 -j DROP
+          sudo iptables -I DOCKER-USER -p tcp --dport 80 -j DROP
+
+      - name: "Phase A — agent work (network-scoped to package registries)"
+        # HOME=/tmp below: OpenCode (Bun) writes its config/cache to
+        # $HOME/.local on startup; the read-only rootfs has no writable
+        # /home, so it needs to land inside the tmpfs already mounted at /tmp.
+        #
+        # --pids-limit=256 (raised from 100, spike-ui-001 zen rerun, found
+        # live): the container also runs the Playwright MCP browser for the
+        # ui-verify step. chromium's headless footprint is ~50 pids and the
+        # opencode/node baseline is ~58, so --pids-limit=100 overflowed
+        # (cgroup pids.max) and every browser launch crashed with "Target
+        # crashed" — the agent had to fall back to an HTTP smoke check. 256
+        # still bounds runaway processes (a fork bomb can't spiral) while
+        # giving a real browser turn enough headroom to actually happen.
+        #
+        # --user "$(id -u):$(id -g)" (not a hardcoded 1000:1000): /workspace
+        # is bind-mounted from the runner's checkout, owned by the runner's
+        # actual uid — a mismatched uid can't write into it even though the
+        # bind mount itself is :rw, since real file-mode bits still apply.
+        # Still never uid 0, so the non-root intent (spec §7) holds either way.
+        #
+        # --add-host=host.docker.internal:host-gateway + HTTP(S)_PROXY: routes
+        # the container's outbound HTTP/HTTPS through the Squid proxy started
+        # above (which runs on the runner host, reachable via the Docker-
+        # provided host-gateway alias) — the DOCKER-USER DROP rules block any
+        # attempt to bypass it and go direct.
+        #
+        # NO_PROXY keeps localhost traffic direct rather than bouncing it
+        # through Squid pointlessly.
+        #
+        # No Cloudflare credentials anywhere in this container: inference goes
+        # straight to OpenCode Zen through the proxy allowlist (.opencode.ai),
+        # authenticated by OPENCODE_API_KEY below. The retired Workers AI shim
+        # (removed 2026-09-21 after a live turn logged zero requests) used to
+        # hold CF_API_TOKEN on the runner instead — that indirection is gone
+        # with it.
+        #
+        # `set +e` + explicit exit-code capture: a crash partway through a
+        # turn still leaves real files on disk, and git history is the
+        # persistence layer between turns (spec §8). Failing the step here
+        # threw that work away and re-ran the same turn from scratch. The
+        # acceptance check below still fails a genuinely empty turn; this only
+        # stops a late crash from discarding work that did happen.
+        #
+        # Self-healing watchdog (2026-08-15, docs/INVESTIGATION_2026-08-15.md):
+        # turns 15-18 (alpha) and 14-17 (beta) burned the full 120-min job
+        # timeout producing ZERO bytes of agent output — the first model call
+        # hung forever and only the job's hard cap ended the turn, which then
+        # reconciled as a 'cancelled' run. (An earlier companion fix — an
+        # upstream timeout inside the retired Workers AI shim — went away
+        # with the shim on 2026-09-21; this watchdog is now the only hang
+        # guard, which is all a provider-driven turn needs.)
+        #
+        # This watchdog is the belt-and-suspenders: the container runs
+        #       in the background while this step watches the turn logs AND
+        #       the working tree. If neither grows for
+        #       WATCHDOG_SILENCE_MINUTES (default 10), the agent is hung —
+        #       healthy agents emit a JSON event every 1-5s (measured: max
+        #       inter-event gap 17.6s on the one successful turn). Kill the
+        #       container, fail the turn FAST, so it records a real 'failure'
+        #       (never a silent 'cancelled') and the scheduler dispatches the
+        #       next turn minutes later instead of 120 minutes later.
+        #
+        # Second guard added 2026-10-15 (WATCHDOG_MAX_MINUTES, default 60):
+        # liveness is not progress. opencode can loop forever on a provider
+        # error — compact, retry, overflow, compact — which keeps the logs
+        # growing (so the silence test stays quiet) while doing zero work.
+        # Such a turn burned the full 120-min job cap on the previous config.
+        # The budget caps total Phase-A wall time across ALL attempts and is
+        # what makes "fail fast" true even when the agent is loud.
+        id: agent
+        env:
+          # Passed via environment, NOT interpolated into the script below:
+          # task_prompt is agent-influenced markdown and routinely contains
+          # backticks, which bash executes inside double quotes (found live
+          # 2026-09-22: a BACKLOG table row with `utm_*` killed 12 straight
+          # turns with exit 127 before docker ever ran). Env values are set
+          # without shell parsing, and expansions are never rescanned — so
+          # the same content passes through intact here.
+          TASK_PROMPT: ${{ inputs.task_prompt || github.event.client_payload.task_prompt }}
+          # Same mechanism for the keys, and for a subtler reason: secrets.*
+          # do NOT exist as variables in the runner shell — they only
+          # materialize via ${{ }} substitution. Referencing $OPENCODE_API_KEY
+          # directly in bash silently yields EMPTY (found live 2026-09-23:
+          # test 002 ran its whole turn on an empty key and died on a
+          # misleading Nvidia 503). Only the ACTIVE key is passed into the
+          # container (-e OPEN_ROUTER_API_KEY below, fed from ATTEMPT_KEY), so
+          # the sandbox never holds the spare pool's key.
+          #
+          # PROVIDER HISTORY (2026-10-13): build turns now run on OpenRouter.
+          # Two providers were ruled out by measurement first, not preference:
+          #   1. OpenCode Zen — free tier is gated to the first-party client
+          #      ("can only be used from within OpenCode"), returning 403
+          #      FreeTierError to ANY headless client, with a valid API key AND
+          #      with no auth header at all (probed 2026-10-12). No device-code
+          #      endpoint exists, so no headless OAuth session either.
+          #   2. Groq — gpt-oss-120b and qwen3.8-27b were both verified agentic
+          #      (multi-turn tool-calling, writing module + test), but the free
+          #      tier refuses a real build-turn opening request: a 13,542-token
+          #      request is rejected against the ~4K ITPM ceiling. Measured, not
+          #      assumed — the arena's always-sent content alone (~4.5K tokens,
+          #      before any skill loads) already exceeds it, so skill trimming
+          #      cannot close the gap.
+          # OpenRouter free models carry 512K-1M context with no per-minute wall,
+          # which is why they were chosen. The Zen and Groq keys stay in secrets so
+          # a revert is a model change, not a re-scaffold; nothing dispatches on them.
+          OR_KEY_1: ${{ secrets.OPEN_ROUTER_API_KEY }}
+          OR_KEY_2: ${{ secrets.OPEN_ROUTER_API_KEY_2 }}
+          # Runner-side pin for the key-selection block below. This MUST be a
+          # step env var: ${{ }} does not interpolate inside run: shells, and
+          # the docker -e flag further down only feeds the container. Found
+          # live 2026-10-17: with this missing, $TEAM_KEY_PIN read as empty on
+          # the runner, every run silently selected OR_KEY_1 as PRIMARY, and
+          # beta spent its attempts on the other team's (exhausted) key while
+          # its own key sat as the unreachable fallback behind the QUOTA_DEATH
+          # veto - so beta's quota probes read 0 forever while its key had 43
+          # requests left.
+          TEAM_KEY_PIN: ${{ contains(github.repository, 'beta') && 'KEY_2' || 'KEY_1' }}
+          # Model ids via env for the same interpolation reason as the prompt
+          # (dispatch-controlled values, never inline). MODEL is the pinned
+          # build model; FALLBACK_MODEL is attempt 3 when the pinned model
+          # fails on both keys.
+          #
+          # MODEL HISTORY, kept because the reasoning is reusable. PRIMARY was
+          # qwen3.8-27b on Groq and gpt-oss-120b was rejected as primary NOT by
+          # preference but by a real integration break (measured 2026-10-13):
+          # gpt-oss completes a first tool call fine, then the NEXT request is
+          # rejected with "'messages.2': for 'role:assistant' the following must
+          # be satisfied [property 'reasoning_content'...]" — it requires a
+          # reasoning_content field on assistant history that OpenCode's message
+          # serialization never emits. Every multi-turn agent session hits this
+          # on its second tool call, so it is not an edge case: the model works,
+          # the driver cannot talk to it.
+          # The pinned PRIMARY is recursive/flint-v1.0:free as of 2026-10-25:
+          # the 2026-10-18 pin (nemotron-3-super-120b-a12b) went upstream-dead on
+          # 2026-10-25 — HTTP 404 "Provider returned error" with "Function ...
+          # Not found for account" on both pools, before a single tool call. It
+          # still listed in the catalog, which is why provider_error() now greps
+          # the generic signature too. Flint was verified agentic by direct API
+          # probe AND a live harness spike (run 40205698968: browser_navigate
+          # x6, browser_snapshot x11, browser_take_screenshot x5, a 7-file
+          # commit, then a by-design quota kill) BEFORE being pinned here.
+          # FALLBACK_MODEL is nemotron-3-ultra-550b-a55b (different upstream,
+          # direct tool-calling probe PASS): the previous dots-3 fallback is
+          # known to fail closed, burning its budget on hidden reasoning and
+          # emitting nothing (INCIDENT_2026-10-17_DEAD_PIN.md §11), so it was
+          # not a safety net in practice.
+          # Free-model availability is volatile; if the pinned primary starts
+          # 404ing or returning provider errors, re-probe the catalog rather than
+          # assuming the id rotted.
+          MODEL: ${{ inputs.model || github.event.client_payload.model || 'openrouter/recursive/flint-v1.0:free' }}
+          FALLBACK_MODEL: ${{ inputs.fallback_model || github.event.client_payload.fallback_model || 'openrouter/nvidia/nemotron-3-ultra-550b-a55b:free' }}
+        run: |
+          set +e
+          CONTAINER="arena-agent-${{ github.run_id }}"
+          WATCHDOG_SILENCE_MINUTES="${WATCHDOG_SILENCE_MINUTES:-10}"
+          # Total Phase-A budget, shared across all attempts (see budget_left).
+          # The silence watchdog CANNOT catch a loud-but-useless loop: found
+          # live 2026-10-15, opencode hit ContextOverflowError (request 13.6K
+          # tokens vs a 7000 ITPM cap), then spent the FULL 120-min job timeout
+          # re-compacting the session and retrying — emitting a JSON event
+          # every few seconds the whole time, so LAST_ACTIVE never went stale.
+          # It reconciled as a 'cancelled' run, and the compaction eventually
+          # summarised the task away entirely (the log ends with the model
+          # reporting "No specific user intent or coding task has been
+          # established"). A bounded budget converts that into a real, fast
+          # 'failure' so the scheduler moves on instead of losing 2 hours.
+          WATCHDOG_MAX_MINUTES="${WATCHDOG_MAX_MINUTES:-60}"
+          STEP_START=$(date +%s)
+
+          # Harness-critical paths are read-only inside the container. A
+          # subverted agent writing a workflow file here is a full
+          # secret-exfiltration vector: "Commit progress" pushes it, and the
+          # pushed .github/workflows/* runs on a NORMAL runner with every
+          # repo secret and unrestricted egress — entirely outside the
+          # sandbox this step exists to provide. Same for .git/hooks (git
+          # executes them during the runner's own push, with ARENA_PUSH_TOKEN
+          # in the step env) and .git/config (could repoint core.hooksPath to
+          # a writable dir or rewrite remotes). Bind-mounting them read-only
+          # makes the write fail at the filesystem level no matter what the
+          # container does — a per-path ro mount beats a blanket .git mount,
+          # which would also lock the agent out of committing (AGENTS.md rule 5).
+          #
+          # The extra mount only applies when the path exists in the checkout;
+          # a missing .github (never the case for a team repo, which always
+          # has the harness + scaffold) would otherwise be created empty by
+          # docker and show up as a phantom change in "Enforce real build output".
+          RO_MOUNTS=()
+          for rel in .github .git/hooks .git/config; do
+            if [ -e "${{ github.workspace }}/$rel" ]; then
+              RO_MOUNTS+=(-v "${{ github.workspace }}/$rel:/workspace/$rel:ro")
+            fi
+          done
+
+          # Key selection: pinned pool first, other pool as failover.
+          if [ "$TEAM_KEY_PIN" = "KEY_2" ] && [ -n "$OR_KEY_2" ]; then
+            PRIMARY_KEY="$OR_KEY_2"
+            FALLBACK_KEY="$OR_KEY_1"
+          else
+            PRIMARY_KEY="$OR_KEY_1"
+            FALLBACK_KEY="$OR_KEY_2"
+          fi
+          if [ -z "$PRIMARY_KEY" ] && [ -n "$FALLBACK_KEY" ]; then
+            echo "::warning::Pinned pool key is empty — starting on the failover pool"
+            PRIMARY_KEY="$FALLBACK_KEY"
+            FALLBACK_KEY=""
+          fi
+          if [ -z "$PRIMARY_KEY" ]; then
+            echo "::error::Neither build provider key is configured (OPEN_ROUTER_API_KEY is empty) — refusing to run a turn with no credentials"
+            exit 1
+          fi
+
+          # One function, up to three calls: pinned attempt, pool failover,
+          # model failover. Body kept at step indent — bash doesn't care, and
+          # it keeps the diff reviewable. Globals (code, TIMED_OUT) are
+          # intentionally NOT local: the failover decisions below read them.
+          run_attempt() {
+            ATTEMPT_KEY="$1"
+            ATTEMPT_MODEL="$2"
+          # One OpenRouter key per team, pinned by repo name (*alpha* -> key 1,
+          # *beta* -> key 2 when present), WITH same-turn failover: if the
+          # pinned pool errors (429/quota/5xx signature in the turn logs)
+          # the attempt's logs are archived and the turn re-runs once on the
+          # other pool, then once more on FALLBACK_MODEL (different upstream —
+          # survives upstream outages that kill both pools identically).
+          # Healthy turns always take exactly one attempt on the pinned
+          # key+model, so attribution stays clean while a dead pool costs one
+          # failed attempt, not a dead team. Kept ABOVE `docker run`: comment
+          # lines inside the -e chain break it (`-e: command not found`,
+          # found live 2026-09-23).
+          # Measured 2026-11-01: the two configured keys ARE separate accounts
+          # on the same provider (independent daily counters), so the pin
+          # provides 2 x 50 requests/day. A second key on the SAME account
+          # would add no quota. Unset _2 behaves exactly like before.
+          # Cadence note (2026-10-15): with the free tier, a team's day is one
+          # budgeted session on its pinned pool (the scheduler holds dispatches
+          # when a pool's cap is spent — src/events/build-quota.ts), so the
+          # failover chain above is a recovery path for early deaths, not a
+          # second helping: by the time the daily cap is hit, the other pool is
+          # either unset (shared-pool case) or another team's account.
+          # Git identity via env, not `git config`: with .git/config mounted
+          # read-only (see RO_MOUNTS above), `git config user.name` would
+          # fail with "could not lock config file" and every agent commit
+          # (AGENTS.md rule 5) would break. Git reads these at commit time
+          # and never needs to write the config file, so commits work while
+          # the config file itself stays untouchable.
+          docker run --rm --name "$CONTAINER" \
+            --cpus="2" --memory="4g" --memory-swap="4g" --pids-limit=256 \
+            --read-only \
+            --tmpfs /tmp:noexec,nosuid,size=500m,mode=1777 \
+            --user="$(id -u):$(id -g)" --cap-drop=ALL --security-opt=no-new-privileges:true \
+            --add-host=host.docker.internal:host-gateway \
+            "${RO_MOUNTS[@]}" \
+            -e HTTP_PROXY=http://host.docker.internal:3128 \
+            -e HTTPS_PROXY=http://host.docker.internal:3128 \
+            -e NO_PROXY=localhost,127.0.0.1,host.docker.internal \
+            -e OR_MODEL="$ATTEMPT_MODEL" \
+            -e OPEN_ROUTER_API_KEY="$ATTEMPT_KEY" \
+            -e TEAM_KEY_PIN=${{ contains(github.repository, 'beta') && 'KEY_2' || 'KEY_1' }} \
+            -e HOME=/tmp \
+            -e GIT_AUTHOR_NAME=arena-turn-agent \
+            -e GIT_AUTHOR_EMAIL=arena-turn-agent@users.noreply.github.com \
+            -e GIT_COMMITTER_NAME=arena-turn-agent \
+            -e GIT_COMMITTER_EMAIL=arena-turn-agent@users.noreply.github.com \
+            -v "${{ github.workspace }}:/workspace:rw" \
+            -w /workspace \
+            arena-team-base:latest \
+            sh -c 'mkdir -p /tmp/.local/share/opencode && printf "{\"openrouter\":{\"type\":\"api\",\"key\":\"%s\"}}" "$OPEN_ROUTER_API_KEY" > /tmp/.local/share/opencode/auth.json && exec opencode run "$1" --model "$OR_MODEL" --auto --format json > opencode-turn.log 2> opencode-turn.err.log' _ "$TASK_PROMPT" &
+          DOCKER_PID=$!
+
+          LAST_BYTES=0
+          LAST_CHANGED=0
+          LAST_ACTIVE=$(date +%s)
+          TIMED_OUT=0
+          QUOTA_DEATH=0
+          # Which kill, if any: silence | budget | quota. Exported below so the
+          # report step names the real cause instead of assuming the watchdog.
+          DISPOSITION=""
+          # Wait for the container to EXIST before arming the watchdog. The
+          # original loop checked `docker inspect ... = "true"` as its entry
+          # condition immediately after `docker run ... &`, but docker run
+          # needs a moment to create the container — so on the first pass the
+          # inspect returned empty, the loop never ran, the watchdog was never
+          # armed, and `wait $DOCKER_PID` then blocked for the whole job
+          # budget. Found live on spike-ui-001: the agent hung on provider
+          # 429s for 118 min and the job was silently killed by the 120-min
+          # cap instead of failing fast at the 10-min silence mark. Poll until
+          # the container shows up (it must either be running or have already
+          # exited); only then does the silence loop below take over.
+          for _ in $(seq 1 60); do
+            STATE=$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)
+            [ -n "$STATE" ] && break
+            sleep 1
+          done
+          # Loop on the CONTAINER's state, not `kill -0 $DOCKER_PID`: a
+          # backgrounded process that has exited stays a zombie until `wait`,
+          # and kill -0 keeps succeeding on a zombie — so that test would never
+          # see a normally-finished turn and the watchdog would wrongly fire.
+          while [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = "true" ]; do
+            sleep 30
+            # Free-tier daily-cap death (2026-10-15; corrected same night
+            # after verify-002). The cap is unrecoverable until the UTC reset,
+            # and opencode retries straight into it while writing NOTHING to
+            # either log we watch: verify-002's session log artifact is a pure
+            # progress feed (step_start/tool_use/text events, zero error
+            # lines) and its err log is empty, yet the turn sat ~13 minutes in
+            # opencode's internal 429 retry loop until the silence watchdog
+            # killed it. So a log-grep alone is dead code on exactly this
+            # failure — probe the attempt's pool directly. remaining <= 0
+            # means every further request 429s: kill now, hand off the
+            # commits, resume after the reset. Deliberately NO pool failover
+            # on quota death (attempt_failed vetoes it): FALLBACK_KEY is the
+            # OTHER team's account (TEAM_KEY_PIN), so retrying a spent cap
+            # there would just spend that team's day — the scheduler's probe
+            # (src/events/build-quota.ts) holds dispatches until reset.
+            QUOTA_LEFT=$(curl -s -m 10 -H "Authorization: Bearer $ATTEMPT_KEY" \
+              https://openrouter.ai/api/v1/key 2>/dev/null \
+              | jq -r '.data.free_model_daily_requests.remaining // empty' 2>/dev/null || true)
+            if [ -n "$QUOTA_LEFT" ] && [ "$QUOTA_LEFT" -le 0 ] 2>/dev/null; then
+              echo "::error::OpenRouter free-tier daily request cap exhausted (probe: remaining=${QUOTA_LEFT}) — killing container ${CONTAINER} rather than retrying an unrecoverable wall. Quota resets at UTC midnight; committed work is the handoff."
+              docker kill "$CONTAINER" 2>/dev/null || true
+              TIMED_OUT=1
+              QUOTA_DEATH=1
+              DISPOSITION="quota"
+              break
+            fi
+            # Belt only (providers that DO surface the signature — Zen-era
+            # behavior; OpenRouter does not, measured above).
+            if grep -qE "free-models-per-day|free_model_daily|FreeUsageLimitError" opencode-turn.log opencode-turn.err.log 2>/dev/null; then
+              echo "::error::OpenRouter free-tier daily request cap exhausted (provider signature in turn logs) — killing container ${CONTAINER} instead of retrying an unrecoverable wall. Quota resets at UTC midnight; committed work is the handoff."
+              docker kill "$CONTAINER" 2>/dev/null || true
+              TIMED_OUT=1
+              QUOTA_DEATH=1
+              DISPOSITION="quota"
+              break
+            fi
+            BYTES=$(( $(wc -c < opencode-turn.log 2>/dev/null || echo 0) + $(wc -c < opencode-turn.err.log 2>/dev/null || echo 0) ))
+            # File changes count as liveness only when the WORKING SET grows
+            # or shrinks — not merely being non-empty, or one write would keep
+            # a then-hung agent marked alive forever. The count (not a hash)
+            # misses same-file edits, but the BYTES signal covers those:
+            # opencode emits a JSON event per step, so a working agent grows
+            # the log constantly regardless of which file it edits.
+            CHANGED=$(git status --porcelain -- . ':!opencode-turn.log' ':!opencode-turn.err.log' ':!opencode-turn.attempt1.log' ':!opencode-turn.attempt1.err.log' ':!opencode-turn.attempt2.log' ':!opencode-turn.attempt2.err.log' 2>/dev/null | wc -l)
+            NOW=$(date +%s)
+            if [ "$BYTES" != "$LAST_BYTES" ] || [ "${CHANGED:-0}" != "$LAST_CHANGED" ]; then
+              LAST_BYTES=$BYTES
+              LAST_CHANGED=${CHANGED:-0}
+              LAST_ACTIVE=$NOW
+            fi
+            if [ $(( NOW - LAST_ACTIVE )) -ge $(( WATCHDOG_SILENCE_MINUTES * 60 )) ]; then
+              echo "::error::Agent silent for ${WATCHDOG_SILENCE_MINUTES} min (no output, no file changes) — killing container ${CONTAINER}"
+              docker kill "$CONTAINER" 2>/dev/null || true
+              TIMED_OUT=1
+              DISPOSITION="silence"
+              break
+            fi
+            # Loud-but-useless loop guard (see WATCHDOG_MAX_MINUTES above).
+            # Checked after the silence test so a silent hang still gets its
+            # more specific 10-min diagnosis.
+            if [ $(( NOW - STEP_START )) -ge $(( WATCHDOG_MAX_MINUTES * 60 )) ]; then
+              echo "::error::Agent exceeded the ${WATCHDOG_MAX_MINUTES}-min turn budget while still emitting output — killing container ${CONTAINER}. A provider retry/compaction loop is loud but makes no progress, so the silence watchdog cannot see it."
+              docker kill "$CONTAINER" 2>/dev/null || true
+              TIMED_OUT=1
+              DISPOSITION="budget"
+              break
+            fi
+          done
+          wait "$DOCKER_PID"
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "timed_out=$TIMED_OUT" >> "$GITHUB_OUTPUT"
+          echo "disposition=$DISPOSITION" >> "$GITHUB_OUTPUT"
+          if [ "$QUOTA_DEATH" = "1" ]; then
+            echo "opencode was killed because the pinned pool's free-tier daily cap is spent (exit ${code})"
+          elif [ "$DISPOSITION" = "silence" ]; then
+            echo "opencode was killed by the silence watchdog after ${WATCHDOG_SILENCE_MINUTES} min of no activity (exit ${code})"
+          elif [ "$DISPOSITION" = "budget" ]; then
+            echo "opencode was killed after exceeding the ${WATCHDOG_MAX_MINUTES}-min turn budget while still emitting output (exit ${code})"
+          else
+            echo "opencode exited $code"
+          fi
+          }  # end run_attempt
+
+          # Failover triggers: the attempt died AND the logs carry a provider
+          # signature (quota/429/5xx/dead model). Anything else (essay with
+          # exit 0, backtick-style 127, empty output) retries elsewhere would
+          # be pointless — those fail identically there. Attempt 2 switches
+          # POOL (same model, per-account quota); attempt 3 switches MODEL
+          # (different upstream — survives upstream outages that kill both
+          # pools identically). Attempt 3 is skipped when FALLBACK_MODEL
+          # equals MODEL (same model twice would be a pointless re-run).
+          provider_error() {
+            # ContextOverflowError/Request too large added 2026-10-15: opencode's
+            # names for a provider rejecting an over-limit request. Without them
+            # the 2-hour compaction loop logged a provider error the harness
+            # could not see, so the turn got NO model failover — and the
+            # fallback model is a different upstream with different limits,
+            # exactly the retry that can succeed.
+            # free-models-per-day added 2026-10-15 (same day, later): if a
+            # provider DOES surface the daily-cap signature in the logs, it
+            # must count as a provider error. (The probe path above sets
+            # QUOTA_DEATH, which is vetoed in attempt_failed — an exhausted
+            # daily cap must not fail over to the other team's account.)
+            # "Provider returned error"/"statusCode":404 added 2026-10-25:
+            # NVIDIA retired the pinned super-120b endpoint provider-side and
+            # opencode logged only that generic message plus a 404, with the
+            # real cause ("Function ... Not found for account") in the response
+            # body. None of the model-not-found patterns above matched, so a
+            # dead upstream looked like a turn that simply wrote no files —
+            # exactly the case attempt 3 (different upstream) exists for.
+            grep -qiE "FreeUsageLimitError|free usage exceeded|free-models-per-day|free_model_daily|HTTP 429|429 Too Many|\[50[234]\]|upstream idle timeout|gateway timeout|service unavailable|Unexpected server error|Provider returned error|\"statusCode\":404|ContextOverflowError|context_length_exceeded|Request too large|model .*not.?found|unknown model|MODEL_NOT_FOUND|model .*deprecated" \
+              opencode-turn.log opencode-turn.err.log 2>/dev/null
+          }
+          attempt_failed() {
+            # QUOTA_DEATH vetoes failover on purpose: FALLBACK_KEY is the
+            # other team's account (TEAM_KEY_PIN), so an exhausted daily cap
+            # must not be paid for out of that team's day. The scheduler's
+            # probe (src/events/build-quota.ts) holds dispatches until reset.
+            [ "$QUOTA_DEATH" != "1" ] && { [ "$code" != "0" ] || [ "$TIMED_OUT" = "1" ]; } && provider_error
+          }
+          # Never start a failover attempt the turn budget cannot pay for:
+          # each attempt gets its own container but shares STEP_START, so a
+          # spent budget kills an attempt at its first watchdog tick. Skipping
+          # it up front keeps the failure report honest about what was tried.
+          budget_left() { [ $(( $(date +%s) - STEP_START )) -lt $(( WATCHDOG_MAX_MINUTES * 60 )) ]; }
+
+          run_attempt "$PRIMARY_KEY" "$MODEL"
+          if attempt_failed && budget_left && [ -n "$FALLBACK_KEY" ] && [ "$FALLBACK_KEY" != "$PRIMARY_KEY" ]; then
+            echo "::warning::Pinned pool errored (provider signature in logs) — failing over to the other pool for one retry"
+            mv opencode-turn.log opencode-turn.attempt1.log 2>/dev/null || true
+            mv opencode-turn.err.log opencode-turn.attempt1.err.log 2>/dev/null || true
+            run_attempt "$FALLBACK_KEY" "$MODEL"
+            if attempt_failed && budget_left && [ -n "$FALLBACK_MODEL" ] && [ "$FALLBACK_MODEL" != "$MODEL" ]; then
+              echo "::warning::Both pools errored on $MODEL (provider signature in logs) — failing over to model $FALLBACK_MODEL for one retry"
+              mv opencode-turn.log opencode-turn.attempt2.log 2>/dev/null || true
+              mv opencode-turn.err.log opencode-turn.attempt2.err.log 2>/dev/null || true
+              run_attempt "$PRIMARY_KEY" "$FALLBACK_MODEL"
+            fi
+          fi
+          exit 0
+        # --auto approves OpenCode's own permission prompts (needed since
+        # there's no human to click "yes" in CI) — the container's cap-drop
+        # and non-root user are what actually bound what --auto can do, not
+        # OpenCode's own permission system alone. --format json makes the log
+        # machine-parseable for the Observatory (spec §11) instead of just
+        # human-readable TUI output.
+
+      - name: Show turn log (debug)
+        if: always()
+        # stderr is captured separately now. Phase A previously redirected
+        # only stdout, so when opencode crashed the actual diagnostic went to
+        # the void and the failure had to be reconstructed from the JSON
+        # stream — a large part of why P0-0a took as long as it did to pin
+        # down. --format json means stdout must stay pure, hence two files
+        # rather than 2>&1.
+        run: |
+          echo "--- stdout ---"
+          cat opencode-turn.log 2>/dev/null || echo "opencode-turn.log not found"
+          echo "--- stderr ---"
+          cat opencode-turn.err.log 2>/dev/null || echo "opencode-turn.err.log not found"
+          echo "--- crash/provider-error signature (empty means neither the P0-0a id bug recurred nor the provider errored) ---"
+          # Auth signatures added 2026-10-11 after event_41cbabb7 burned 19 turns
+          # on dead pool keys with no signal at all: the 401 was outside every
+          # pattern here, so the signature printed EMPTY on a turn that had failed
+          # at the credential boundary. An error the operator must act on (rotate
+          # keys) must be visible in this line, not inferred from the exit code.
+          grep -iE "expected 'id'|InvalidResponseData|FreeUsageLimitError|free usage exceeded|HTTP 429|429 Too Many|\[50[234]\]|upstream idle timeout|gateway timeout|service unavailable|Unexpected server error|Provider returned error|ContextOverflowError|context_length_exceeded|Request too large|Failed to execute statement|model .*not.?found|unknown model|MODEL_NOT_FOUND|model .*deprecated|Invalid credential|\"statusCode\":401|\"statusCode\":404|401 Unauthorized|unauthorized|invalid[_ ]api[_ ]key" \
+            opencode-turn.log opencode-turn.err.log 2>/dev/null || true
+
+      - name: Enforce real build output
+        # Found live (see docs/INVESTIGATION_2026-07-28.md P0-0a / NEW-1): a
+        # build turn can emit a text essay, invoke zero tools, write zero
+        # files, and still exit 0 — `opencode run` succeeding only means the
+        # CLI didn't crash, not that any work happened. This was the actual
+        # gap behind build_pipeline's gate passing while both closed-beta
+        # team repos ended up with no product code. Fail here, before Phase B
+        # or the commit step, so a no-op turn is reported as a failure
+        # instead of a silent success.
+        run: |
+          START_HEAD="${{ steps.turnstart.outputs.head }}"
+          NOW_HEAD=$(git rev-parse HEAD)
+          # Lockfile exclusions above exist because npm/pip rewrite lockfiles
+          # as a side effect of installing dependencies. Found live 2026-09-28
+          # (three times in one day): a turn that wrote NO product code still
+          # produced a "file change" — a bare `"license": "MIT"` line npm added
+          # to package-lock.json — which satisfied this very gate and let a
+          # no-op turn report success. The gate exists to catch exactly that
+          # (P0-0a), so churn must not count as output. A turn that ONLY adds
+          # or removes a dependency is still real work and is NOT excluded —
+          # package.json always counts.
+          CHANGED=$(git status --porcelain -- . ':!opencode-turn.log' ':!opencode-turn.err.log' ':!opencode-turn.attempt1.log' ':!opencode-turn.attempt1.err.log' ':!opencode-turn.attempt2.log' ':!opencode-turn.attempt2.err.log' ':!package-lock.json' ':!yarn.lock' ':!pnpm-lock.yaml' ':!poetry.lock' ':!uv.lock' ':!Cargo.lock' ':!composer.lock' ':!go.sum')
+          if [ -z "$CHANGED" ] && [ "$NOW_HEAD" = "$START_HEAD" ]; then
+            # "No files written" has two very different causes, and conflating them
+            # sent a whole event's investigation the wrong way. Measured live on
+            # event_41cbabb7: 19 consecutive turns reported that the agent "emitted
+            # text without writing any files", when opencode had never made a single
+            # successful API call. The prompt looked broken. It was not.
+            #
+            # DIAGNOSIS CORRECTED 2026-10-13: this block originally concluded "the
+            # pool keys are dead — replace them" and sent the whole event's operator
+            # down the wrong path. The keys were never expired. Probing the same
+            # keys directly (2026-10-12) showed `/zen/v1/models` returning HTTP 200 —
+            # they authenticate. What fails is the FREE TIER: completions return 403
+            # FreeTierError "OpenCode's free tier can only be used from within
+            # OpenCode", with a valid key AND with no auth header at all. The '401
+            # Invalid credential' string is an UPSTREAM WRAPPER around that rejection,
+            # not the platform rejecting the key. Replacing the keys would have fixed
+            # nothing; switching providers did.
+            #
+            # So this is a PROVIDER-ACCESS failure, not a bad key and not an
+            # agent-discipline failure. It is still not retried on the failover
+            # model or the other pool: an auth/free-tier rejection is
+            # provider- and key-level, not model-level, so a retry on the other
+            # account burns an identical failure. Named
+            # explicitly so it exits before the generic "agent emitted text" message
+            # below and so no operator is told to rotate a working credential.
+            if grep -qiE 'Invalid credential|401 Unauthorized|"statusCode":401|unauthorized|invalid[_ ]api[_ ]key|FreeUsageLimitError|free usage exceeded|FreeTierError' \
+                 opencode-turn.log opencode-turn.err.log opencode-turn.attempt*.log opencode-turn.attempt*.err.log 2>/dev/null; then
+              echo "::error::PROVIDER ACCESS FAILURE - the agent never reached the model. The request was rejected upstream (401/Invalid credential wrapper, or 403 FreeTierError). Do NOT rotate the keys: they authenticate fine (/models returns 200). The provider's free tier is refusing headless clients. This is NOT an agent-discipline failure and NOT a prompt problem."
+              exit 1
+            fi
+            echo "::error::Build turn produced no file changes and no commits — the agent emitted text without writing any files or committing anything. Failing the job instead of reporting a false success."
+            exit 1
+          fi
+          # Same-SHA guard (3fc1cb03 live: 20 turns same head_sha loop) — if
+          # git HEAD was not advanced beyond START_HEAD and the only changes
+          # are re-edits of the same content, surface it; scheduler's
+          # same-SHA check will also mark the team ineligible.
+          if [ "$NOW_HEAD" = "$START_HEAD" ] && [ -n "$CHANGED" ]; then
+            echo "::warning::Turn produced file changes but no commit — will be committed below, but repeated same-SHA turns indicate a stuck loop."
+          fi
+          # Detect repeated identical commits: if last 3 commits have identical diff stat (same file list), warn.
+          if [ "$NOW_HEAD" != "$START_HEAD" ]; then
+            if [ "$(git diff --name-only $START_HEAD..$NOW_HEAD | wc -l)" -eq 0 ]; then
+              echo "::warning::Commits made but diff is empty vs START_HEAD — possible same-SHA recommits."
+            fi
+          fi
+          echo "Files changed this turn (uncommitted):"
+          echo "$CHANGED"
+          if [ "$NOW_HEAD" != "$START_HEAD" ]; then
+            echo "Commits made this turn ($START_HEAD..$NOW_HEAD):"
+            git log --oneline "$START_HEAD..$NOW_HEAD"
+          fi
+
+      - name: Phase B — install dependencies (network-scoped to package registries)
+        # The verification step below runs --network=none, so dependencies
+        # must already exist in the workspace before it starts. Installed here
+        # in a container with the SAME scoped egress as Phase A (Squid proxy +
+        # DOCKER-USER DROP rules; only npmjs.org + PyPI are allowlisted):
+        # npm -> node_modules/, pip -> ./.pydeps (the image rootfs is
+        # --read-only, so pip cannot write system site-packages — PYTHONPATH
+        # points the verification step at .pydeps instead). node_modules/ and
+        # .pydeps/ are .gitignore'd so vendored deps never land in the team
+        # repo.
+        #
+        # set +e + explicit exit-code capture + exit 0: a broken install must
+        # not skip the "Commit progress" step below — the turn's work is
+        # preserved regardless, and the failure is surfaced by the verification
+        # step (via INSTALL_EXIT_CODE) and the final "Report verification
+        # failure" step, so the turn records as 'failure' (executed, judged),
+        # never as lost work.
+        id: install
+        run: |
+          set +e
+          # Bounded retry (whole-arena sim finding, docs/ARENA_CONDUCT_V3.md
+          # §10: one-shot flaky verification cost ~10pp end-to-end winner accuracy
+          # — a single transient registry/network hiccup flipped a turn to
+          # 'failure' that a retry would have passed, and over a multi-turn event
+          # that compounds into wrong winners). npm ci / pip install over the
+          # Squid proxy are the transient-failure-prone steps; a REAL install
+          # error (bad requirement, missing package) fails identically on all
+          # attempts and still surfaces via INSTALL_EXIT_CODE below.
+          ATTEMPTS=3
+          code=0
+          # Same harness-critical ro mounts as Phase A (see that step's
+          # comment): a compromised npm/pip package runs its postinstall
+          # scripts with rw workspace + network here, and the verification
+          # container runs the agent's own test/build code — both are equally
+          # able to drop a workflow file or git hook that "Commit progress"
+          # would then push to a NORMAL runner with full secrets + egress.
+          RO_MOUNTS=()
+          for rel in .github .git/hooks .git/config; do
+            if [ -e "${{ github.workspace }}/$rel" ]; then
+              RO_MOUNTS+=(-v "${{ github.workspace }}/$rel:/workspace/$rel:ro")
+            fi
+          done
+          for attempt in $(seq 1 $ATTEMPTS); do
+            docker run --rm \
+              --cpus="2" --memory="4g" --memory-swap="4g" --pids-limit=100 \
+              --read-only \
+              --tmpfs /tmp:noexec,nosuid,size=500m,mode=1777 \
+              --user="$(id -u):$(id -g)" --cap-drop=ALL --security-opt=no-new-privileges:true \
+              --add-host=host.docker.internal:host-gateway \
+              "${RO_MOUNTS[@]}" \
+              -e HTTP_PROXY=http://host.docker.internal:3128 \
+              -e HTTPS_PROXY=http://host.docker.internal:3128 \
+              -e NO_PROXY=localhost,127.0.0.1,host.docker.internal \
+              -e HOME=/tmp \
+              -v "${{ github.workspace }}:/workspace:rw" \
+              -w /workspace \
+              arena-team-base:latest \
+              sh -c 'set +e
+              FAILED=0
+              if [ -f package.json ]; then
+                echo "--- dependency install: npm ---"
+                if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+                  echo "lockfile found -> npm ci"
+                  npm ci --no-audit --no-fund || FAILED=1
+                else
+                  echo "no lockfile -> npm install"
+                  npm install --no-audit --no-fund || FAILED=1
+                fi
+              elif [ -f requirements.txt ]; then
+                echo "--- dependency install: pip (requirements.txt) ---"
+                python3 -m pip install --disable-pip-version-check --no-cache-dir --target /workspace/.pydeps -r requirements.txt || FAILED=1
+              elif [ -f pyproject.toml ]; then
+                echo "--- dependency install: pip (pyproject.toml) ---"
+                python3 -m pip install --disable-pip-version-check --no-cache-dir --target /workspace/.pydeps . > /tmp/pip-project.log 2>&1
+                code=$?
+                if [ $code -ne 0 ] && grep -q "does not appear to be a Python project" /tmp/pip-project.log; then
+                  echo "::warning::pyproject.toml is not a Python package (no build-system) — nothing to install from it"
+                elif [ $code -ne 0 ]; then
+                  cat /tmp/pip-project.log
+                  FAILED=1
+                fi
+              else
+                echo "no package.json, requirements.txt or pyproject.toml — no dependencies to install"
+              fi
+              touch .gitignore
+              grep -qF "node_modules/" .gitignore || echo "node_modules/" >> .gitignore
+              grep -qF "/.pydeps/" .gitignore || echo "/.pydeps/" >> .gitignore
+              echo "install phase FAILED=$FAILED"
+              exit $FAILED'
+            code=$?
+            if [ $code -eq 0 ]; then
+              echo "install container succeeded on attempt $attempt"
+              break
+            fi
+            echo "install attempt $attempt of $ATTEMPTS failed (exit $code) — retrying; a real install error fails all attempts, this only absorbs transient registry/network hiccups"
+            sleep 10
+          done
+          echo "install container exited $code (0 = deps present, 1 = install failed after $ATTEMPTS attempts)"
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Phase B — locked-down verification (network=none)
+        # This step runs fully --network=none — it runs AFTER the agent's
+        # network-needing work AND after the install step above (the only step
+        # that touches package registries), building and testing the code that
+        # was just written with zero network access during execution. Defense
+        # in depth against the generated code itself trying to exfiltrate
+        # anything, independent of whether the agent that wrote it was
+        # trustworthy.
+        #
+        # Language-aware gate (2026-08-06, replaces the old `npm test
+        # --if-present` line): the old gate passed any repo whose package.json
+        # lacked a test script, so a backend that did not even compile (tsc
+        # errors) sailed through — the 2026-07-29..08-01 event saw 0 of 5
+        # turns across 2 teams ever run tests. Now: a node repo gets `npx tsc
+        # --noEmit` when tsconfig.json exists and `npm test` when a test
+        # script exists; a Python repo gets `python3 -m compileall` and pytest
+        # when installed. Any failed check fails the turn.
+        #
+        # set +e + exit 0 here: a failed check must NOT skip the "Commit
+        # progress" step below — the agent's work and the
+        # VERIFICATION_FAILURE.log written here are committed and pushed
+        # first, and the final "Report verification failure" step flips the
+        # run's conclusion to 'failure'. reconcileBuildTurns reads that as
+        # executed-and-failed (status 'completed', conclusion 'failure') —
+        # counted, judged, and the team moves on; never 'cancelled', which
+        # would misread the outcome and wedge the team.
+        id: verify
+        run: |
+          set +e
+          # Bounded retry (same A6 rationale as the install step): tsc /
+          # compileall are deterministic, but a test run can fail transiently
+          # (resource contention under the 2-CPU pids-limit, a test that
+          # polls a port it bound microseconds too early). A deterministic
+          # failure fails both attempts identically and still records
+          # VERIFICATION_FAILURE.log for the next turn.
+          ATTEMPTS=2
+          code=0
+          # Same harness-critical ro mounts as Phase A (see that step's
+          # comment): this container runs the agent's OWN test/build code at
+          # full write privilege on the workspace — every bit as capable of
+          # planting a workflow file or git hook. network=none stops it from
+          # EXFILTRATING, but the planted file would still get pushed by
+          # "Commit progress" below and execute on a normal runner later.
+          RO_MOUNTS=()
+          for rel in .github .git/hooks .git/config; do
+            if [ -e "${{ github.workspace }}/$rel" ]; then
+              RO_MOUNTS+=(-v "${{ github.workspace }}/$rel:/workspace/$rel:ro")
+            fi
+          done
+          for attempt in $(seq 1 $ATTEMPTS); do
+            docker run --rm \
+              --cpus="2" --memory="4g" --memory-swap="4g" --pids-limit=50 \
+              --network=none --read-only \
+              --tmpfs /tmp:noexec,nosuid,size=200m,mode=1777 \
+              --user="$(id -u):$(id -g)" --cap-drop=ALL --security-opt=no-new-privileges:true \
+              -e HOME=/tmp \
+              -e PYTHONPATH=/workspace/.pydeps \
+              -e PYTHONPYCACHEPREFIX=/tmp/pycache \
+              -e TURN_ID="${{ github.event.inputs.turn_id || github.event.client_payload.turn_id }}" \
+              -e INSTALL_EXIT_CODE="${{ steps.install.outputs.exit_code }}" \
+              "${RO_MOUNTS[@]}" \
+              -v "${{ github.workspace }}:/workspace:rw" \
+              -w /workspace \
+              arena-team-base:latest \
+              sh -c 'set +e
+              VERIFY_FAILED=0
+              ERRLOG=/tmp/verify-errors.log
+              REPORT=/workspace/VERIFICATION_FAILURE.log
+              NOTE=/workspace/VERIFICATION_NOTE.log
+              rm -f "$ERRLOG" "$REPORT" "$NOTE"
+              fail() {
+                echo "::error::$1"
+                echo "$1" >> "$ERRLOG"
+                VERIFY_FAILED=1
+              }
+              # Warnings get committed too, as VERIFICATION_NOTE.log: "no tests
+              # ran" is not a hard fail (turn 1 legitimately starts without a
+              # suite), but it IS a standing requirement the next turn must
+              # address — the turn prompt tells the agent to read this file.
+              # git add -A in the Commit progress step picks it up automatically.
+              note() {
+                echo "::warning::$1"
+                echo "turn $TURN_ID: $1" >> "$NOTE"
+              }
+              echo "--- language-aware verification (network=none) ---"
+              echo "turn: $TURN_ID"
+              if [ "$INSTALL_EXIT_CODE" != "0" ]; then
+                fail "dependency install failed (install phase exit code $INSTALL_EXIT_CODE) — see the Phase B install step log; build checks skipped"
+              elif [ -f package.json ]; then
+                echo "[node] package.json present"
+                if [ ! -d node_modules ]; then
+                  # A dependency-free node app legitimately has no node_modules
+                  # after a successful install (found live, spike-ui-001: the
+                  # turn agent built a dependency-free node:http app — `npm
+                  # install` succeeded and still created no node_modules, and
+                  # the old unconditional check hard-failed the whole turn on
+                  # it). Only fail when the manifest actually declares
+                  # dependencies that should have been installed.
+                  if node -e "const p=require('./package.json');const d=Object.assign({},p.dependencies,p.devDependencies);process.exit(Object.keys(d).length?0:1)"; then
+                    fail "node_modules missing after the install phase — dependencies were not installed"
+                  else
+                    echo "[node] no dependencies declared — node_modules not expected, skipping"
+                  fi
+                else
+                  if [ -f tsconfig.json ]; then
+                    echo "[node] tsconfig.json present -> npx tsc --noEmit"
+                    out=$(npx --no-install tsc --noEmit 2>&1)
+                    code=$?
+                    echo "$out"
+                    if [ $code -ne 0 ]; then
+                      echo "$out" >> "$ERRLOG"
+                      fail "TypeScript type-check failed (npx tsc --noEmit) — if typescript is not in devDependencies, add it with: npm install --save-dev typescript"
+                    else
+                      echo "[node] type-check passed"
+                    fi
+                  else
+                    echo "[node] no tsconfig.json — type-check skipped"
+                  fi
+                  if node -e "const p=require(\"./package.json\");process.exit(p.scripts&&p.scripts.test?0:1)"; then
+                    echo "[node] test script present -> npm test"
+                    out=$(npm test 2>&1)
+                    code=$?
+                    echo "$out"
+                    if [ $code -ne 0 ]; then
+                      echo "$out" >> "$ERRLOG"
+                      fail "npm test failed (exit $code)"
+                    else
+                      echo "[node] tests passed"
+                    fi
+                  else
+                    note "package.json has no test script — no tests ran this turn. The turn prompt requires every turn to add or extend at least one test; the next turn must create a test suite and a test script."
+                  fi
+                fi
+              elif [ -f requirements.txt ] || [ -f pyproject.toml ]; then
+                echo "[python] Python manifest present"
+                out=$(python3 -m compileall -q -x "/(\.pydeps|\.git|\.github|\.pytest_cache)/" . 2>&1)
+                code=$?
+                echo "$out"
+                if [ $code -ne 0 ]; then
+                  echo "$out" >> "$ERRLOG"
+                  fail "python3 -m compileall found syntax errors (exit $code)"
+                else
+                  echo "[python] byte-compile passed"
+                fi
+                if python3 -m pytest --version >/dev/null 2>&1; then
+                  echo "[python] pytest installed -> python3 -m pytest -q"
+                  out=$(python3 -m pytest -q -p no:cacheprovider 2>&1)
+                  code=$?
+                  echo "$out"
+                  if [ $code -eq 0 ]; then
+                    echo "[python] tests passed"
+                  elif [ $code -eq 5 ]; then
+                    note "pytest collected no tests — the turn prompt requires every turn to add or extend at least one test; the next turn must add real tests."
+                  else
+                    echo "$out" >> "$ERRLOG"
+                    fail "pytest failed (exit $code)"
+                  fi
+                else
+                  note "pytest not installed — only byte-compile ran (add pytest to requirements.txt to get a test gate; the turn prompt requires every turn to add or extend at least one test)."
+                fi
+              elif find . -name "*.py" -not -path "./.pydeps/*" -not -path "./.git/*" 2>/dev/null | grep -q .; then
+                echo "[python] .py files present but no requirements.txt/pyproject.toml — byte-compiling anyway"
+                out=$(python3 -m compileall -q -x "/(\.pydeps|\.git|\.github|\.pytest_cache)/" . 2>&1)
+                code=$?
+                echo "$out"
+                if [ $code -ne 0 ]; then
+                  echo "$out" >> "$ERRLOG"
+                  fail "python3 -m compileall found syntax errors (exit $code)"
+                else
+                  echo "[python] byte-compile passed"
+                fi
+              else
+                echo "no package.json, requirements.txt, pyproject.toml or Python files — nothing to build or test yet"
+              fi
+              if [ $VERIFY_FAILED -ne 0 ]; then
+                {
+                  echo "=== Build verification FAILED — turn $TURN_ID ==="
+                  echo "Reported $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                  echo "This file is committed by the commit step so the next"
+                  echo "turn can see what broke. Fix the checks below, then rebuild."
+                  echo ""
+                  cat "$ERRLOG"
+                } > "$REPORT"
+                exit 1
+              fi
+              echo "--- verification passed ---"
+              exit 0'
+            code=$?
+            if [ $code -eq 0 ]; then
+              echo "verification container succeeded on attempt $attempt"
+              break
+            fi
+            echo "verification attempt $attempt of $ATTEMPTS failed (exit $code) — retrying once; a deterministic failure fails both attempts identically"
+            sleep 10
+          done
+          if [ $code -ne 0 ]; then
+            echo "verify_failed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "verification container exited $code (0 = checks passed, 1 = checks failed after $ATTEMPTS attempts — reported at the end so this turn's work is still committed)"
+          exit 0
+
+      - name: Commit progress
+        # The push uses a credential that carries the `workflows` OAuth scope:
+        # GITHUB_TOKEN can never carry that scope (`workflows` is a
+        # PAT/GitHub-App scope, not a GITHUB_TOKEN permission, so
+        # `permissions: workflows: write` is not even a valid YAML key).
+        # Use the repo's ARENA_PUSH_TOKEN (a PAT with the `workflow` scope)
+        # for the push; the default GITHUB_TOKEN is the fallback so the
+        # harness still works on repos without that secret.
+        #
+        # Verified 2026-09-20: ARENA_PUSH_TOKEN is set NEITHER at repo level
+        # (main + team repos) NOR verifiably at org level (403 on the org
+        # secrets API from here) — so every push today runs the `else` branch
+        # on GITHUB_TOKEN. That is load-bearing, not incidental: it works
+        # ONLY because the restore guard below guarantees the push never
+        # contains .github/ changes (which GITHUB_TOKEN would 403 on). If a
+        # push ever needs to carry workflow files, set ARENA_PUSH_TOKEN
+        # (repo or org level) instead of debugging the 403.
+        #
+        # NOTE: since the turn agent no longer owns workflow files (they are
+        # harness-owned and ro-mounted in every container — see Phase A), the
+        # push should never contain .github/ changes at all. The restore
+        # guard below enforces that: it resets .github/ to the turn-start
+        # HEAD (and drops any untracked file inside it) so a subverted agent
+        # or a compromised dependency can never push a workflow file that
+        # would then execute on a NORMAL runner with full secrets and egress.
+        env:
+          ARENA_PUSH_TOKEN: ${{ secrets.ARENA_PUSH_TOKEN }}
+        run: |
+          git config user.name "arena-bot[${{ github.event.inputs.team || github.event.client_payload.team }}]"
+          git config user.email "arena-bot@users.noreply.github.com"
+          START_HEAD="${{ steps.turnstart.outputs.head }}"
+          # Restore harness-critical paths the turn must never change. The
+          # per-path ro mounts make container-side writes fail at the
+          # filesystem level; this is the second layer for anything that
+          # slips past them (e.g. a git-level trick that stages a blob
+          # without a working-tree write). checkout restores tracked files;
+          # clean -fd drops untracked ones (a brand-new workflow file) that
+          # checkout would leave in place.
+          git checkout "$START_HEAD" -- .github/ 2>/dev/null \
+            || echo "::warning::could not reset .github/ to $START_HEAD — check for workflow file tampering"
+          git clean -fd -- .github/ 2>/dev/null || true
+          # .git/hooks and .git/config are untracked, so there is nothing to
+          # checkout — the ro mounts are their only protection. Sanity-check
+          # anyway: a hook would execute during THIS push with
+          # ARENA_PUSH_TOKEN in the step env, and core.hooksPath/config
+          # rewrites would redirect the runner's own git.
+          NON_SAMPLE_HOOKS=$(find .git/hooks -maxdepth 1 -type f ! -name "*.sample" 2>/dev/null)
+          if [ -n "$NON_SAMPLE_HOOKS" ]; then
+            echo "::error::unexpected git hooks found in the workspace (they would run during this push): $NON_SAMPLE_HOOKS"
+            echo "$NON_SAMPLE_HOOKS" | xargs -r rm -f
+          fi
+          git add -A
+          # Lockfile-restore guard (2026-09-28): `git add -A` above sweeps up
+          # whatever the install phase's package manager rewrote. Restore any
+          # lockfile whose ONLY change this turn was metadata churn, so a
+          # dependency-install side effect never becomes a committed "result".
+          # Deliberately narrow, and it runs BEFORE the commit below so a turn
+          # with real product work commits it untouched:
+          #   - fires only when no non-lockfile file changed this turn;
+          #   - `git checkout` restores content, so a lockfile the agent
+          #     genuinely rewrote alongside real work still gets restored
+          #     ONLY if nothing else changed — otherwise it is left alone;
+          #   - VERIFICATION_FAILURE.log is NEVER restored: it is the
+          #     next turn's required reading and must reach history.
+          REAL_CHANGES=$(git status --porcelain -- . ':!opencode-turn.log' ':!opencode-turn.err.log' ':!opencode-turn.attempt1.log' ':!opencode-turn.attempt1.err.log' ':!opencode-turn.attempt2.log' ':!opencode-turn.attempt2.err.log' ':!package-lock.json' ':!yarn.lock' ':!pnpm-lock.yaml' ':!poetry.lock' ':!uv.lock' ':!Cargo.lock' ':!composer.lock' ':!go.sum' | grep -v 'VERIFICATION_FAILURE.log' || true)
+          if [ -z "$REAL_CHANGES" ]; then
+            LOCK_CHURN=$(git status --porcelain -- . ':!opencode-turn.log' ':!opencode-turn.err.log' ':!opencode-turn.attempt1.log' ':!opencode-turn.attempt1.err.log' ':!opencode-turn.attempt2.log' ':!opencode-turn.attempt2.err.log' ':!VERIFICATION_FAILURE.log' | awk '{print $NF}' | grep -E '(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|uv\.lock|Cargo\.lock|composer\.lock|go\.sum)$' || true)
+            if [ -n "$LOCK_CHURN" ]; then
+              echo "::warning::Only dependency-lockfile metadata changed this turn (install side effect, not product work) — restoring instead of committing:"
+              echo "$LOCK_CHURN" | sed 's/^/    /'
+              for f in $LOCK_CHURN; do
+                # `git checkout HEAD -- <path>` (not bare `git checkout --`):
+                # this step runs AFTER `git add -A`, so the churn is already
+                # staged and a bare checkout would restore from the index —
+                # a no-op. Restoring from HEAD updates index AND worktree, so
+                # the file ends up clean and the later commit skips it.
+                # "Exists in HEAD?" — NOT `git ls-files`, which lists the
+                # INDEX: `git add -A` above has already staged a brand-new
+                # lockfile, so ls-files calls it known and a bare checkout
+                # then fails with "pathspec did not match". cat-file against
+                # HEAD is the only correct test (scratch cases 1-6).
+                if git cat-file -e "HEAD:$f" 2>/dev/null; then
+                  git checkout HEAD -- "$f" || true
+                else
+                  # Newly created lockfile: `git rm -f` drops it from index AND
+                  # worktree. `git clean` cannot - the file is staged, so it is
+                  # no longer "untracked" as far as git is concerned.
+                  git rm -f -q -- "$f" >/dev/null 2>&1 || true
+                fi
+              done
+            fi
+          fi
+          git diff --cached --quiet || git commit -m "Build turn ${{ github.event.inputs.turn_id || github.event.client_payload.turn_id }}"
+          if [ -n "$ARENA_PUSH_TOKEN" ]; then
+            # actions/checkout sets an http.extraheader with GITHUB_TOKEN
+            # (a GitHub App token), and git sends that Authorization header in
+            # preference to the credential embedded in the push URL — so the
+            # PAT in the URL was silently ignored and GitHub still saw a
+            # GitHub App token and refused the workflow-file changes. Drop the
+            # extraheader first so the PAT is the only credential offered.
+            git config --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+            git push "https://x-access-token:${ARENA_PUSH_TOKEN}@github.com/${{ github.repository }}.git" HEAD:${GITHUB_REF##*/}
+          else
+            git push
+          fi
+
+      - name: Upload turn log as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-turn-${{ github.event.inputs.turn_id || github.event.client_payload.turn_id }}
+          path: |
+            opencode-turn.log
+            opencode-turn.err.log
+            **/*.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Report agent crash (after the work was preserved)
+        # Runs last on purpose (only the verification-failure report below
+        # runs after it). If opencode crashed but still produced files,
+        # everything above has already verified, committed and pushed that
+        # work — the next turn continues from it instead of redoing it. The
+        # turn is still reported as failed, because it did fail: honest CI
+        # status, without throwing away real progress to get it.
+        if: steps.agent.outputs.exit_code != '0'
+        run: |
+          # The disposition, not timed_out alone, names the kill: a budget kill
+          # is loud (a retry/compaction loop) and a quota kill is unrecoverable
+          # until the UTC reset, so reporting either as "silence watchdog" sent
+          # the 2026-10-17 diagnosis down the wrong path (run 39013607598 — the
+          # real cause was the 60-min budget; the old message said silence).
+          # timed_out=1 with an empty disposition can only come from an older
+          # synced harness; the generic watchdog line still covers that.
+          if [ "${{ steps.agent.outputs.timed_out }}" = "1" ]; then
+            if [ "${{ steps.agent.outputs.disposition }}" = "budget" ]; then
+              echo "::error::Agent exceeded the 60-min turn budget while still emitting output (a provider retry/compaction loop makes no progress) — killed rather than burning the full job timeout. This turn records a real failure; any files produced before the kill were committed and pushed."
+            elif [ "${{ steps.agent.outputs.disposition }}" = "quota" ]; then
+              echo "::error::Agent was killed because the pinned pool's free-tier daily request cap is spent; the quota probe holds the next dispatch until the UTC reset, so the committed work is the handoff."
+            else
+              echo "::error::Agent was killed by the silence watchdog (no output and no file changes for 10+ minutes) instead of burning the full job timeout. This turn records a real failure — the scheduler dispatches the next turn minutes from now rather than 2 hours from now. Any files produced before the stall were committed and pushed."
+            fi
+          else
+            echo "::error::opencode exited ${{ steps.agent.outputs.exit_code }}. Any files it produced before crashing were committed and pushed; this turn is reported failed so the outcome is not silently treated as success."
+          fi
+          exit 1
+
+      - name: Report verification failure (after the work was preserved)
+        # Runs last on purpose, same shape as "Report agent crash" above: the
+        # verification step exits 0 so "Commit progress" has already committed
+        # and pushed the agent's work along with VERIFICATION_FAILURE.log —
+        # which is what the NEXT turn's agent reads to see what broke. This
+        # step is what flips the run's conclusion to 'failure':
+        # reconcileBuildTurns records status='completed' + conclusion='failure',
+        # which counts as executed (the judge sees it, the team advances) —
+        # never 'cancelled', which would misread the outcome.
+        if: steps.verify.outputs.verify_failed == 'true'
+        run: |
+          echo "::error::Build verification FAILED this turn — see the Phase B verification step log above and the committed VERIFICATION_FAILURE.log. The agent's work was committed and pushed; this turn is reported failed so the outcome is not silently treated as success."
+          exit 1
+# Re-pushed 2026-07-23 to trigger GitHub Actions workflow_dispatch re-indexing
+# (recurring GitHub quirk, same fix as before — dispatches 422 with
+# "Workflow does not have 'workflow_dispatch' trigger" immediately after a
+# push that touches this file, even though the trigger is clearly present).
