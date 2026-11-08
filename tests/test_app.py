@@ -138,3 +138,60 @@ def test_restock_chart_has_accessible_name(tmp_path):
     assert response.status_code == 200
     assert 'setAttribute("role", "img")' in response.text
     assert 'setAttribute("aria-label"' in response.text
+
+
+def test_recommendations_exclude_sales_older_than_forecast_window(tmp_path):
+    client = make_client(tmp_path)
+    stale = client.post(
+        "/ingest",
+        json=[
+            {
+                "date": (datetime.now() - timedelta(days=45)).isoformat(),
+                "item_id": "rice",
+                "qty": 50,
+                "price": 2.5,
+            }
+        ],
+    )
+    assert stale.status_code == 201
+    stock = client.put("/stock", json={"item_id": "rice", "qty": 5})
+    assert stock.status_code == 200
+    response = client.get("/recommendations")
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_recommendations_forecast_ignores_sales_outside_window(tmp_path):
+    client = make_client(tmp_path)
+    stale = client.post(
+        "/ingest",
+        json=[
+            {
+                "date": (datetime.now() - timedelta(days=40)).isoformat(),
+                "item_id": "rice",
+                "qty": 50,
+                "price": 2.5,
+            }
+        ],
+    )
+    assert stale.status_code == 201
+    fresh = client.post(
+        "/ingest",
+        json=[
+            {
+                "date": (datetime.now() - timedelta(days=2)).isoformat(),
+                "item_id": "rice",
+                "qty": 3,
+                "price": 2.5,
+            }
+        ],
+    )
+    assert fresh.status_code == 201
+    stock = client.put("/stock", json={"item_id": "rice", "qty": 30})
+    assert stock.status_code == 200
+    response = client.get("/recommendations")
+    assert response.status_code == 200
+    # Only the fresh 3-unit sale is in the 30-day window; its weekly forecast
+    # (~21 units) stays under the stock threshold (~24), so no alert fires.
+    # A stale high-volume sale inside the history must not inflate the forecast.
+    assert response.json() == []

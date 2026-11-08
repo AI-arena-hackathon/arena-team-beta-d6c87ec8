@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from pydantic import AliasChoices, BaseModel, field_validator
 from sqlalchemy import Engine
-from sqlmodel import Field, Session, SQLModel, create_engine, select
+from sqlmodel import Field, Index, Session, SQLModel, create_engine, select
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./data.db")
 FORECAST_WINDOW_DAYS = 30
@@ -19,6 +19,7 @@ RESTOCK_FRACTION = 0.8
 
 
 class Sale(SQLModel, table=True):
+    __table_args__ = (Index("ix_sales_date", "date"),)
     id: Optional[int] = Field(default=None, primary_key=True)
     date: datetime
     item_id: str
@@ -90,6 +91,11 @@ class AlertTarget(BaseModel):
     item_id: Optional[str] = None
 
 
+def fetch_window_sales(engine: Engine, window_start: datetime) -> list:
+    with Session(engine) as session:
+        return session.exec(select(Sale).where(Sale.date >= window_start)).all()
+
+
 def compute_recommendations(sales: list, stocks: dict) -> list:
     now = datetime.now(timezone.utc)
     window_start = now - timedelta(days=FORECAST_WINDOW_DAYS)
@@ -153,8 +159,9 @@ def send_sms(recommendation: Optional[RecommendationOut], settings: AlertSetting
 
 
 def recompute_and_store(engine: Engine) -> None:
+    window_start = datetime.now(timezone.utc) - timedelta(days=FORECAST_WINDOW_DAYS)
+    sales = fetch_window_sales(engine, window_start)
     with Session(engine) as session:
-        sales = session.exec(select(Sale)).all()
         stocks = {s.item_id: s.qty for s in session.exec(select(Stock)).all()}
     recommendations = compute_recommendations(sales, stocks)
     with Session(engine) as session:
@@ -241,8 +248,9 @@ def create_app(database_url: str = "sqlite:///./data.db") -> FastAPI:
 
     @app.get("/recommendations")
     def get_recommendations():
+        window_start = datetime.now(timezone.utc) - timedelta(days=FORECAST_WINDOW_DAYS)
+        sales = fetch_window_sales(engine, window_start)
         with Session(engine) as session:
-            sales = session.exec(select(Sale)).all()
             stocks = {s.item_id: s.qty for s in session.exec(select(Stock)).all()}
         return [r.model_dump() for r in compute_recommendations(sales, stocks)]
 
@@ -270,8 +278,9 @@ def create_app(database_url: str = "sqlite:///./data.db") -> FastAPI:
 
     @app.post("/alerts")
     def send_alert(target: AlertTarget):
+        window_start = datetime.now(timezone.utc) - timedelta(days=FORECAST_WINDOW_DAYS)
+        sales = fetch_window_sales(engine, window_start)
         with Session(engine) as session:
-            sales = session.exec(select(Sale)).all()
             stocks = {s.item_id: s.qty for s in session.exec(select(Stock)).all()}
             settings_row = session.exec(select(AlertSettings).where(AlertSettings.id == 1)).first()
             settings = settings_row if settings_row is not None else AlertSettings(id=1)
