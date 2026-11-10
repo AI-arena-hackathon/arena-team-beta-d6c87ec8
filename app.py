@@ -175,6 +175,7 @@ def recompute_and_store(engine: Engine) -> None:
                     stock_qty=rec.stock_qty,
                     reorder_qty=rec.reorder_qty,
                     confidence=rec.confidence,
+                    created_at=datetime.now(timezone.utc),
                 )
             )
         session.commit()

@@ -3,8 +3,9 @@
 from datetime import datetime, timedelta
 
 from fastapi.testclient import TestClient
+from sqlmodel import Session, select
 
-from app import create_app
+from app import Recommendation, create_app, recompute_and_store
 
 
 def make_client(tmp_path):
@@ -195,3 +196,136 @@ def test_recommendations_forecast_ignores_sales_outside_window(tmp_path):
     # (~21 units) stays under the stock threshold (~24), so no alert fires.
     # A stale high-volume sale inside the history must not inflate the forecast.
     assert response.json() == []
+
+
+def _sell(client, item_id: str, qty_per_day: int, days: int = 10) -> None:
+    rows = [
+        {"date": (datetime.now() - timedelta(days=d)).isoformat(), "item_id": item_id, "qty": qty_per_day, "price": 2.5}
+        for d in range(1, days + 1)
+    ]
+    response = client.post("/ingest", json=rows)
+    assert response.status_code == 201
+
+
+def test_stock_upsert_creates_then_updates(tmp_path):
+    client = make_client(tmp_path)
+    created = client.put("/stock", json={"item_id": "rice", "qty": 7})
+    assert created.status_code == 200
+    assert created.json() == {"item_id": "rice", "qty": 7}
+
+    updated = client.put("/stock", json={"item_id": "rice", "qty": 2})
+    assert updated.status_code == 200
+    assert updated.json() == {"item_id": "rice", "qty": 2}
+
+    other = client.put("/stock", json={"item_id": "beans", "qty": 4})
+    assert other.status_code == 200
+    assert other.json() == {"item_id": "beans", "qty": 4}
+
+
+def test_stock_update_rejects_negative_qty(tmp_path):
+    client = make_client(tmp_path)
+    response = client.put("/stock", json={"item_id": "rice", "qty": -1})
+    assert response.status_code == 422
+
+
+def test_alert_settings_default_when_unset(tmp_path):
+    client = make_client(tmp_path)
+    response = client.get("/settings")
+    assert response.status_code == 200
+    assert response.json() == {"phone": "", "threshold": None, "enabled": True}
+
+
+def test_alert_settings_update_persists_round_trip(tmp_path):
+    client = make_client(tmp_path)
+    put = client.put("/settings", json={"phone": "+15550001111", "threshold": 12.5, "enabled": False})
+    assert put.status_code == 200
+    assert put.json() == {"phone": "+15550001111", "threshold": 12.5, "enabled": False}
+    get = client.get("/settings")
+    assert get.status_code == 200
+    assert get.json() == {"phone": "+15550001111", "threshold": 12.5, "enabled": False}
+
+
+def test_alert_settings_reject_negative_threshold(tmp_path):
+    client = make_client(tmp_path)
+    response = client.put("/settings", json={"phone": "+15550001111", "threshold": -1, "enabled": True})
+    assert response.status_code == 422
+
+
+def test_alert_disabled_does_not_send(tmp_path):
+    client = make_client(tmp_path)
+    _sell(client, "rice", 3)
+    client.put("/stock", json={"item_id": "rice", "qty": 5})
+    client.put("/settings", json={"phone": "+15550001111", "threshold": 10, "enabled": False})
+    sent = client.post("/alerts", json={"item_id": "rice"})
+    assert sent.status_code == 200
+    assert sent.json()["sent"] is False
+
+
+def test_alert_unknown_item_returns_no_recommendation(tmp_path):
+    client = make_client(tmp_path)
+    sent = client.post("/alerts", json={"item_id": "ghost"})
+    assert sent.status_code == 200
+    assert sent.json()["sent"] is False
+    assert sent.json()["reason"] == "no_recommendation"
+
+
+def test_recompute_stores_recommendations_with_created_at(tmp_path):
+    client = make_client(tmp_path)
+    _sell(client, "rice", 3)
+    client.put("/stock", json={"item_id": "rice", "qty": 5})
+    recompute_and_store(client.app.state.engine)
+    with Session(client.app.state.engine) as session:
+        stored = session.exec(select(Recommendation)).all()
+    assert len(stored) == 1
+    assert stored[0].created_at is not None
+
+
+def test_ingest_rejects_negative_price_and_accepts_alias_and_multi_item(tmp_path):
+    client = make_client(tmp_path)
+    bad = client.post(
+        "/ingest",
+        json=[{"date": "2026-11-01T09:00:00", "item_id": "rice", "qty": 1, "price": -1}],
+    )
+    assert bad.status_code == 422
+    alias = client.post(
+        "/ingest",
+        json=[{"date": "2026-11-01T09:00:00", "item-id": "rice", "qty": 2, "price": 1.5}],
+    )
+    assert alias.status_code == 201
+    multi = client.post(
+        "/ingest",
+        json=[
+            {"date": "2026-11-01T09:00:00", "item_id": "rice", "qty": 1, "price": 2.5},
+            {"date": "2026-11-01T10:00:00", "item_id": "beans", "qty": 2, "price": 1.5},
+        ],
+    )
+    assert multi.status_code == 201
+    assert multi.json()["ingested"] == 2
+
+
+def test_recommendations_return_at_most_top_five_sorted_by_forecast(tmp_path):
+    client = make_client(tmp_path)
+    for i in range(1, 7):
+        _sell(client, f"item-{i}", 3 * i)
+        client.put("/stock", json={"item_id": f"item-{i}", "qty": 1})
+    response = client.get("/recommendations")
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data) == 5
+    forecasts = [r["forecast_qty"] for r in data]
+    assert forecasts == sorted(forecasts, reverse=True)
+
+
+def test_recommendation_reports_reorder_qty_and_confidence(tmp_path):
+    client = make_client(tmp_path)
+    _sell(client, "rice", 3)
+    client.put("/stock", json={"item_id": "rice", "qty": 5})
+    response = client.get("/recommendations")
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data) == 1
+    recommendation = data[0]
+    forecast_qty = recommendation["forecast_qty"]
+    assert forecast_qty == 21.0
+    assert recommendation["reorder_qty"] == 16.0
+    assert recommendation["confidence"] == 0.71
