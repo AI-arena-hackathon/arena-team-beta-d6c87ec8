@@ -115,6 +115,24 @@ def test_alert_sends_when_forecast_crosses_threshold(tmp_path):
     assert body["to"] == "+15550001111"
 
 
+def test_alert_without_item_id_targets_top_recommendation(tmp_path):
+    client = make_client(tmp_path)
+    rows = [
+        {"date": (datetime.now() - timedelta(days=d)).isoformat(), "item_id": "rice", "qty": 3, "price": 2.5}
+        for d in range(1, 11)
+    ]
+    ingest = client.post("/ingest", json=rows)
+    assert ingest.status_code == 201
+    stock = client.put("/stock", json={"item_id": "rice", "qty": 5})
+    assert stock.status_code == 200
+    sent = client.post("/alerts", json={})
+    assert sent.status_code == 200
+    body = sent.json()
+    assert body["sent"] is True
+    assert body["provider"] == "mock"
+    assert body["item_id"] == "rice"
+
+
 def test_index_serves_accessible_html_with_skip_link(tmp_path):
     client = make_client(tmp_path)
     response = client.get("/")
@@ -131,6 +149,14 @@ def test_recommendations_list_is_polite_live_region(tmp_path):
     response = client.get("/")
     assert response.status_code == 200
     assert '<ol id="recommendations" aria-live="polite">' in response.text
+
+
+def test_recommendations_script_allows_reassigning_last_recommendations(tmp_path):
+    client = make_client(tmp_path)
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "let lastRecommendations = [];" in response.text
+    assert "const lastRecommendations" not in response.text
 
 
 def test_restock_chart_has_accessible_name(tmp_path):

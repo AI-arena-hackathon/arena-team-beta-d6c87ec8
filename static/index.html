@@ -105,7 +105,7 @@
       }
     }
 
-    const lastRecommendations = [];
+    let lastRecommendations = [];
 
     async function loadRecommendations() {
       const response = await fetch("/recommendations");

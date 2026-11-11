@@ -127,6 +127,14 @@ def compute_recommendations(sales: list, stocks: dict) -> list:
     return sorted(results, key=lambda r: r.forecast_qty, reverse=True)[:5]
 
 
+def compute_top_recommendations(engine: Engine) -> list[RecommendationOut]:
+    window_start = datetime.now(timezone.utc) - timedelta(days=FORECAST_WINDOW_DAYS)
+    sales = fetch_window_sales(engine, window_start)
+    with Session(engine) as session:
+        stocks = {s.item_id: s.qty for s in session.exec(select(Stock)).all()}
+    return compute_recommendations(sales, stocks)
+
+
 def should_send_alert(settings: AlertSettings, forecast_qty: float) -> bool:
     if not settings.enabled:
         return False
@@ -159,11 +167,7 @@ def send_sms(recommendation: Optional[RecommendationOut], settings: AlertSetting
 
 
 def recompute_and_store(engine: Engine) -> None:
-    window_start = datetime.now(timezone.utc) - timedelta(days=FORECAST_WINDOW_DAYS)
-    sales = fetch_window_sales(engine, window_start)
-    with Session(engine) as session:
-        stocks = {s.item_id: s.qty for s in session.exec(select(Stock)).all()}
-    recommendations = compute_recommendations(sales, stocks)
+    recommendations = compute_top_recommendations(engine)
     with Session(engine) as session:
         for existing in session.exec(select(Recommendation)).all():
             session.delete(existing)
@@ -249,11 +253,7 @@ def create_app(database_url: str = "sqlite:///./data.db") -> FastAPI:
 
     @app.get("/recommendations")
     def get_recommendations():
-        window_start = datetime.now(timezone.utc) - timedelta(days=FORECAST_WINDOW_DAYS)
-        sales = fetch_window_sales(engine, window_start)
-        with Session(engine) as session:
-            stocks = {s.item_id: s.qty for s in session.exec(select(Stock)).all()}
-        return [r.model_dump() for r in compute_recommendations(sales, stocks)]
+        return [r.model_dump() for r in compute_top_recommendations(engine)]
 
     @app.get("/settings")
     def get_settings():
@@ -279,18 +279,15 @@ def create_app(database_url: str = "sqlite:///./data.db") -> FastAPI:
 
     @app.post("/alerts")
     def send_alert(target: AlertTarget):
-        window_start = datetime.now(timezone.utc) - timedelta(days=FORECAST_WINDOW_DAYS)
-        sales = fetch_window_sales(engine, window_start)
+        recommendations = compute_top_recommendations(engine)
         with Session(engine) as session:
-            stocks = {s.item_id: s.qty for s in session.exec(select(Stock)).all()}
             settings_row = session.exec(select(AlertSettings).where(AlertSettings.id == 1)).first()
             settings = settings_row if settings_row is not None else AlertSettings(id=1)
-            recommendations = compute_recommendations(sales, stocks)
-            recommendation = None
-            if target.item_id:
-                recommendation = next((r for r in recommendations if r.item_id == target.item_id), None)
-            elif recommendations:
-                recommendation = recommendations[0]
+        recommendation = None
+        if target.item_id:
+            recommendation = next((r for r in recommendations if r.item_id == target.item_id), None)
+        elif recommendations:
+            recommendation = recommendations[0]
         return send_sms(recommendation, settings)
 
     app.mount("/", StaticFiles(directory="static", html=True), name="static")
